@@ -1,0 +1,223 @@
+use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
+use bincode;
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::json;
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::RpcSendTransactionConfig,
+};
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    signature::{Keypair, Signer},
+    transaction::VersionedTransaction,
+};
+use std::{fs::File, io::Read, path::PathBuf};
+
+ 
+const PRIORITY_FEE_URL: &str = "https://api-v3.raydium.io/main/auto-fee";
+const SWAP_BASE: &str = "https://transaction-v1.raydium.io";
+
+ 
+const RPC_URL: &str = "https://api.mainnet-beta.solana.com";
+const KEYPAIR_PATH: &str = "/Users/yehor/Documents/raydium_ts/phantom_keypair.json";
+
+ 
+const INPUT_MINT: &str = "So11111111111111111111111111111111111111112"; // WSOL
+const OUTPUT_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC
+const AMOUNT: u64 = 100_000;            // 100,000 lamports = 0.0001 SOL
+const SLIPPAGE_BPS: u64 = 1 * 100;     // 1% slippage = 100 basis points
+const TX_VERSION: &str = "V0";
+const WRAP_SOL: bool = true;            
+const UNWRAP_SOL: bool = false;         
+
+#[derive(Deserialize)]
+struct PriorityFeeResponse {
+    data: PriorityFeeDataWrapper,
+}
+
+#[derive(Deserialize)]
+struct PriorityFeeDataWrapper {
+    default: FeeTiers,
+}
+
+#[derive(Deserialize)]
+struct FeeTiers {
+    vh: u64,
+    h: u64,
+    m: u64,
+}
+
+ 
+#[derive(Deserialize)]
+struct SwapTransactionResponse {
+    data: Vec<SwapTxObject>,
+}
+
+#[derive(Deserialize)]
+struct SwapTxObject {
+    transaction: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+  
+    let owner = read_keypair_from_file(KEYPAIR_PATH)
+        .with_context(|| format!("Failed to read keypair from {}", KEYPAIR_PATH))?;
+
+   
+    let rpc_client = RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::confirmed());
+
+ 
+    let http_client = Client::new();
+
+   
+    println!("Calling priority-fee at: {}", PRIORITY_FEE_URL);
+    let fee_resp = http_client
+        .get(PRIORITY_FEE_URL)
+        .send()
+        .await
+        .context("Failed to call priority-fee endpoint")?;
+    if !fee_resp.status().is_success() {
+        return Err(anyhow!("priority-fee endpoint returned HTTP {}", fee_resp.status()));
+    }
+    let fee_json: PriorityFeeResponse = fee_resp
+        .json()
+        .await
+        .context("Failed to parse priority-fee JSON")?;
+    let high_fee: u64 = fee_json.data.default.h;
+    println!("Using 'high' fee tier = {} micro-lamports", high_fee);
+
+ 
+    let quote_url = format!(
+        "{}/compute/swap-base-in?inputMint={}&outputMint={}&amount={}&slippageBps={}&txVersion={}",
+        SWAP_BASE, INPUT_MINT, OUTPUT_MINT, AMOUNT, SLIPPAGE_BPS, TX_VERSION
+    );
+    println!("Fetching swap quote from: {}", quote_url);
+    let quote_resp = http_client
+        .get(&quote_url)
+        .send()
+        .await
+        .context("Failed to call compute/swap-base-in")?;
+    if !quote_resp.status().is_success() {
+        return Err(anyhow!("compute/swap-base-in returned HTTP {}", quote_resp.status()));
+    }
+   
+    let swap_response_json: serde_json::Value = quote_resp
+        .json()
+        .await
+        .context("Failed to parse swap quote JSON")?;
+
+ 
+    if let Some(route) = swap_response_json.get("route") {
+        println!("– Pools chosen in this route:");
+        if let Some(array) = route.as_array() {
+            for (i, step) in array.iter().enumerate() {
+                if let Some(pool_addr) = step.pointer("/marketKeys/swapPool") {
+                    println!("  Leg {} → pool = {}", i + 1, pool_addr);
+                }
+            }
+        }
+    }
+
+     
+    let tx_request_body = json!({
+        "computeUnitPriceMicroLamports": high_fee.to_string(),
+        "swapResponse": swap_response_json,
+        "txVersion": TX_VERSION,
+        "wallet": owner.pubkey().to_string(),
+        "wrapSol": WRAP_SOL,
+        "unwrapSol": UNWRAP_SOL
+    });
+    let tx_url = format!("{}/transaction/swap-base-in", SWAP_BASE);
+    println!("Building swap transaction via: {}", tx_url);
+    let tx_resp = http_client
+        .post(&tx_url)
+        .json(&tx_request_body)
+        .send()
+        .await
+        .context("Failed to call transaction/swap-base-in")?;
+    if !tx_resp.status().is_success() {
+        return Err(anyhow!("transaction/swap-base-in returned HTTP {}", tx_resp.status()));
+    }
+    let swap_tx_json: SwapTransactionResponse = tx_resp
+        .json()
+        .await
+        .context("Failed to parse transaction/swap-base-in JSON")?;
+
+ 
+    let mut versioned_transactions = Vec::new();
+    for (i, obj) in swap_tx_json.data.iter().enumerate() {
+        let raw_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&obj.transaction)
+            .with_context(|| format!("Leg {}: failed to Base64-decode transaction", i + 1))?;
+
+        let vtx: VersionedTransaction = bincode::deserialize(&raw_bytes)
+            .with_context(|| format!("Leg {}: failed to bincode-deserialize VersionedTransaction", i + 1))?;
+        versioned_transactions.push(vtx);
+    }
+    println!("total {} transactions", versioned_transactions.len());
+
+    
+    for (i, vtx) in versioned_transactions.into_iter().enumerate() {
+      
+        let signed_vtx = VersionedTransaction::try_new(vtx.message.clone(), &[&owner])
+            .context("Failed to rebuild VersionedTransaction with signature")?;
+
+      
+        println!("{} transaction sending...", i + 1);
+        let signature = rpc_client
+            .send_transaction_with_config(
+                &signed_vtx,
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..RpcSendTransactionConfig::default()
+                },
+            )
+            .context("Failed to send VersionedTransaction")?;
+
+        
+        rpc_client
+            .confirm_transaction_with_commitment(&signature, CommitmentConfig::finalized())
+            .context("Failed to confirm transaction")?;
+
+        println!("{} transaction confirmed, txId: {}", i + 1, signature);
+        println!("🔍 http://solscan.io/tx/{}", signature);
+    }
+
+    Ok(())
+}
+
+ 
+fn read_keypair_from_file(path: &str) -> Result<Keypair> {
+    let path_buf = PathBuf::from(path);
+    let mut file = File::open(&path_buf)
+        .with_context(|| format!("Failed to open keypair file: {:?}", path_buf))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)
+        .context("Failed to read keypair file as string")?;
+    let raw: Vec<u8> = serde_json::from_str(&buf).context("Keypair JSON is not a `Vec<u8>`")?;
+    let kp = Keypair::from_bytes(&raw).context("Invalid Keypair bytes (must be 64 bytes)")?;
+    Ok(kp)
+}
+
+[package]
+name = "raydium_swap_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.21"
+bincode = "1.3"
+
+# Match the Solana crates to your local solana installation; here we use 1.18.26
+solana-client = "1.18.26"
+solana-sdk = "1.18.26"
+
+anyhow = "1.0"
+

@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+/**/*.rs.bk
+
+# IntelliJ / VSCode
+.idea/
+/.vscode/
+
+# Environment variables files
+.env
+.env.local
+.env.*
+!.env.example
+
+# Keypair files
+**/phantom_keypair.json
+**/*.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Lock files (optional; you may check in Cargo.lock for reproducibility)
+/Cargo.lock
+
+# Any other secrets or credentials
+*.pem
+*.key
